@@ -145,3 +145,5 @@ examples/notebooks/wandb/
 wandb/
 
 .vscode
+# Benchmark outputs (results from run_local_bench.py)
+results/
