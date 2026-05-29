@@ -2,9 +2,8 @@
 """OpenVul local-benchmark evaluation script.
 
 Runs the OpenVul model (e.g. Leopo1d/OpenVul-Qwen3-4B-GRPO) against a local
-benchmark of attack JSONs, scores each prompt with n=8 independent samples,
-and reports Pass@1 (per-sample) and Pass@8 (per-prompt). No majority voting —
-each sample is an independent trial, matching the upstream OpenVul metric.
+benchmark of attack JSONs, scores each prompt with n=1 sample, and reports
+per-prompt accuracy and FNR/FPR.
 
 Dataset format:
   Each file is a single-element array with fields:
@@ -111,18 +110,13 @@ def compute_flag(gt, pred):
 
 
 def compute_summary(records):
-    # Each record holds 8 sample_flags (one per sampled completion).
-    tp = sum(f == "tp" for r in records for f in r["sample_flags"])
-    fp = sum(f == "fp" for r in records for f in r["sample_flags"])
-    fn = sum(f == "fn" for r in records for f in r["sample_flags"])
-    tn = sum(f == "tn" for r in records for f in r["sample_flags"])
+    tp = sum(r["flag"] == "tp" for r in records)
+    fp = sum(r["flag"] == "fp" for r in records)
+    fn = sum(r["flag"] == "fn" for r in records)
+    tn = sum(r["flag"] == "tn" for r in records)
     total = tp + fp + fn + tn
 
-    # Pass@1: per-sample accuracy across the 8N trials.
-    pass_at_1 = (tp + tn) / total if total > 0 else 0.0
-    # Pass@8: per-prompt, fraction with ≥1 of 8 sampled completions correct.
-    pass_at_8 = (sum(1 for r in records if r["pass_at_8"]) / len(records)) if records else 0.0
-
+    accuracy = (tp + tn) / total if total > 0 else 0.0
     fnr = fn / (tp + fn) if (tp + fn) > 0 else 0.0
     fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
 
@@ -130,8 +124,7 @@ def compute_summary(records):
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
         "total_samples": total,
         "n_prompts": len(records),
-        "pass_at_1": pass_at_1,
-        "pass_at_8": pass_at_8,
+        "accuracy": accuracy,
         "false_negative_rate": fnr,
         "false_positive_rate": fpr,
     }
@@ -151,29 +144,15 @@ def load_dataset(dataset_path):
     return records
 
 
-def run_evaluation(args):
-    from vllm import LLM, SamplingParams
-
-    print(f"Loading model {args.model} ...")
-    llm = LLM(model=args.model, tensor_parallel_size=args.tp)
-    tokenizer = llm.get_tokenizer()
-
-    sampling_params = SamplingParams(
-        n=8,
-        temperature=0.6,
-        top_p=0.95,
-        top_k=20,
-        min_p=0,
-        repetition_penalty=1.0,
-        max_tokens=32768,
-    )
-
-    records = load_dataset(args.dataset_path)
-    print(f"Loaded {len(records)} records from {args.dataset_path}")
+def _eval_one_dataset(llm, tokenizer, sampling_params, dataset_path, mode,
+                      output_dir, variant, save):
+    """Evaluate a single dataset_path with an already-loaded model."""
+    records = load_dataset(dataset_path)
+    print(f"Loaded {len(records)} records from {dataset_path}")
 
     results = []
     for i, record in enumerate(records):
-        user_prompt = build_user_prompt(record, args.mode)
+        user_prompt = build_user_prompt(record, mode)
         prompt_str = tokenizer.apply_chat_template(
             [{"role": "system", "content": SYSTEM_PROMPT},
              {"role": "user",   "content": user_prompt}],
@@ -183,56 +162,77 @@ def run_evaluation(args):
         )
 
         output = llm.generate([prompt_str], sampling_params)[0]
-        raw_outputs = [o.text for o in output.outputs]
-
         gt = "yes" if record["target"] == 1 else "no"
-
-        # Classify each sampled completion independently — no aggregation.
-        # "unknown" (format-broken parses) counts as the wrong answer,
-        # matching the official OpenVul calculate_metrics behavior.
-        sample_verdicts = [parse_verdict(text) for text in raw_outputs]
-        sample_preds = ["yes" if v == "has_vul" else "no" for v in sample_verdicts]
-        sample_flags = [compute_flag(gt, p) for p in sample_preds]
-
-        n_correct = sum(1 for f in sample_flags if f in ("tp", "tn"))
-        pass_at_8 = n_correct > 0
-
         src = record.get("_source_file", f"record_{i}")
-        print(f"  [{i+1}/{len(records)}] {src}: gt={gt} "
-              f"correct={n_correct}/{len(raw_outputs)} "
-              f"pass@8={'Y' if pass_at_8 else 'N'} flags={sample_flags}")
 
-        results.append({
-            "input":            user_prompt,
-            "all_outputs":      raw_outputs,
-            "sample_verdicts":  sample_verdicts,  # has_vul / no_vul / unknown per sample
-            "sample_preds":     sample_preds,     # yes / no per sample
-            "sample_flags":     sample_flags,     # tp / fp / fn / tn per sample
-            "n_correct":        n_correct,
-            "pass_at_8":        pass_at_8,
-            "is_vulnerable":    gt,
-            "idx":              record.get("idx", i + 1),
-            "dataset":          record.get("dataset", "custom"),
-        })
+        n_completions = len(output.outputs)
+        if n_completions == 1:
+            raw_output = output.outputs[0].text
+            verdict = parse_verdict(raw_output)
+            pred = "yes" if verdict == "has_vul" else "no"
+            flag = compute_flag(gt, pred)
+            print(f"  [{i+1}/{len(records)}] {src}: gt={gt} pred={pred} flag={flag}")
+            results.append({
+                "input":         user_prompt,
+                "output":        raw_output,
+                "verdict":       verdict,
+                "pred":          pred,
+                "flag":          flag,
+                "is_vulnerable": gt,
+                "idx":           record.get("idx", i + 1),
+                "dataset":       record.get("dataset", "custom"),
+            })
+        else:
+            all_outputs = [o.text for o in output.outputs]
+            verdicts = [parse_verdict(t) for t in all_outputs]
+            votes = {
+                "has_vul": verdicts.count("has_vul"),
+                "no_vul":  verdicts.count("no_vul"),
+                "unknown": verdicts.count("unknown"),
+            }
+            print(f"  [{i+1}/{len(records)}] {src}: gt={gt} "
+                  f"has_vul={votes['has_vul']}/{n_completions} "
+                  f"no_vul={votes['no_vul']}/{n_completions}")
+            results.append({
+                "input":         user_prompt,
+                "all_outputs":   all_outputs,
+                "verdicts":      verdicts,
+                "votes":         votes,
+                "is_vulnerable": gt,
+                "idx":           record.get("idx", i + 1),
+                "dataset":       record.get("dataset", "custom"),
+            })
 
-    summary = compute_summary(results)
-    print(
-        f"\nSummary over {summary['n_prompts']} prompts × 8 samples "
-        f"= {summary['total_samples']} trials:\n"
-        f"  tp={summary['tp']} fp={summary['fp']} "
-        f"fn={summary['fn']} tn={summary['tn']}\n"
-        f"  Pass@1 (per-sample): {summary['pass_at_1']*100:.2f}%\n"
-        f"  Pass@8 (per-prompt): {summary['pass_at_8']*100:.2f}%\n"
-        f"  FNR={summary['false_negative_rate']*100:.2f}%  "
-        f"FPR={summary['false_positive_rate']*100:.2f}%"
-    )
+    n_completions = sampling_params.n
+    if n_completions == 1:
+        summary = compute_summary(results)
+        print(
+            f"\nSummary over {summary['n_prompts']} prompts:\n"
+            f"  tp={summary['tp']} fp={summary['fp']} "
+            f"fn={summary['fn']} tn={summary['tn']}\n"
+            f"  Accuracy: {summary['accuracy']*100:.2f}%\n"
+            f"  FNR={summary['false_negative_rate']*100:.2f}%  "
+            f"FPR={summary['false_positive_rate']*100:.2f}%"
+        )
+    else:
+        total_has = sum(r["votes"]["has_vul"] for r in results)
+        total_no  = sum(r["votes"]["no_vul"]  for r in results)
+        summary = {
+            "n_prompts": len(results),
+            "n_completions_each": n_completions,
+            "total_has_vul_votes": total_has,
+            "total_no_vul_votes":  total_no,
+        }
+        print(f"\nVote summary over {len(results)} prompts × {n_completions} completions:")
+        for r in results:
+            src = r.get("idx", "?")
+            print(f"  idx={src}: has_vul={r['votes']['has_vul']}/{n_completions}")
 
-    if args.save:
-        os.makedirs(args.output_dir, exist_ok=True)
-        # Infer category from output_dir (last path component)
-        category = os.path.basename(args.output_dir)
-        out_name = f"{args.variant}__{args.mode}__n8__C_NPD_{category}.json"
-        out_path = os.path.join(args.output_dir, out_name)
+    if save:
+        os.makedirs(output_dir, exist_ok=True)
+        category = os.path.basename(output_dir)
+        out_name = f"{variant}__{mode}__n{n_completions}__C_NPD_{category}.json"
+        out_path = os.path.join(output_dir, out_name)
         with open(out_path, "w") as fh:
             json.dump([summary] + results, fh, indent=2)
         print(f"Saved to {out_path}")
@@ -240,23 +240,75 @@ def run_evaluation(args):
     return results
 
 
+def run_evaluation(args):
+    from vllm import LLM, SamplingParams
+
+    print(f"Loading model {args.model} ...")
+    llm = LLM(model=args.model, tensor_parallel_size=args.tp)
+    tokenizer = llm.get_tokenizer()
+
+    sampling_params = SamplingParams(
+        n=args.n,
+        temperature=0.6,
+        top_p=0.95,
+        top_k=20,
+        min_p=0,
+        repetition_penalty=1.0,
+        max_tokens=32768,
+    )
+
+    # Support multi-dataset batch mode (model loaded once, all datasets evaluated).
+    # args.dataset_paths is set when multiple --dataset-path values are given.
+    dataset_paths = getattr(args, "dataset_paths", None) or [args.dataset_path]
+    output_dirs   = getattr(args, "output_dirs",   None) or [args.output_dir]
+    variants      = getattr(args, "variants",       None) or [args.variant]
+
+    all_results = []
+    for dp, od, var in zip(dataset_paths, output_dirs, variants):
+        print(f"\n=== {var} | {dp} ===")
+        res = _eval_one_dataset(llm, tokenizer, sampling_params,
+                                dp, args.mode, od, var, args.save)
+        all_results.extend(res)
+    return all_results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run OpenVul on attack datasets.")
-    parser.add_argument("--dataset-path", required=True,
-                        help="Path to variant dir (e.g. OpenVul/datasets/C/NPD/dpi/findrec)")
-    parser.add_argument("--output-dir", required=True,
-                        help="Directory to save result JSON")
-    parser.add_argument("--variant", required=True,
-                        help="Variant name (e.g. findrec)")
+    # Single-dataset form (backward compat)
+    parser.add_argument("--dataset-path",
+                        help="Path to a single variant dir")
+    parser.add_argument("--output-dir",
+                        help="Directory to save result JSON (single-dataset form)")
+    parser.add_argument("--variant",
+                        help="Variant name (single-dataset form)")
+    # Multi-dataset batch form: pass lists of equal length
+    parser.add_argument("--dataset-paths", nargs="+",
+                        help="Paths to multiple variant dirs (model loaded once)")
+    parser.add_argument("--output-dirs", nargs="+",
+                        help="Output dirs matching --dataset-paths")
+    parser.add_argument("--variants", nargs="+",
+                        help="Variant names matching --dataset-paths")
+
     parser.add_argument("--mode", choices=["generic", "npd"], default="generic",
                         help="Prompt mode: generic (original) or npd (NPD-focused)")
     parser.add_argument("--model", default="Leopo1d/OpenVul-Qwen3-4B-GRPO",
                         help="HuggingFace model ID")
     parser.add_argument("--tp", type=int, default=1,
                         help="Tensor parallel size for vLLM")
+    parser.add_argument("--n", type=int, default=1,
+                        help="Number of completions per prompt (>1 stores vote distribution, no majority voting)")
     parser.add_argument("--save", action="store_true",
                         help="Save result JSON to output-dir")
     args = parser.parse_args()
+
+    # Validate: must have either single or batch form
+    has_single = bool(args.dataset_path and args.output_dir and args.variant)
+    has_batch  = bool(args.dataset_paths and args.output_dirs and args.variants)
+    if not has_single and not has_batch:
+        parser.error("Provide either --dataset-path/--output-dir/--variant "
+                     "or --dataset-paths/--output-dirs/--variants")
+    if has_batch and len(args.dataset_paths) != len(args.output_dirs) != len(args.variants):
+        parser.error("--dataset-paths, --output-dirs, --variants must all have the same length")
 
     run_evaluation(args)
 
