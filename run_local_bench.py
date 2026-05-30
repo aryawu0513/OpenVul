@@ -110,13 +110,17 @@ def compute_flag(gt, pred):
 
 
 def compute_summary(records):
-    tp = sum(r["flag"] == "tp" for r in records)
-    fp = sum(r["flag"] == "fp" for r in records)
-    fn = sum(r["flag"] == "fn" for r in records)
-    tn = sum(r["flag"] == "tn" for r in records)
+    # Each record holds sample_flags (list) for n>=1 independent samples.
+    tp = sum(f == "tp" for r in records for f in r["sample_flags"])
+    fp = sum(f == "fp" for r in records for f in r["sample_flags"])
+    fn = sum(f == "fn" for r in records for f in r["sample_flags"])
+    tn = sum(f == "tn" for r in records for f in r["sample_flags"])
     total = tp + fp + fn + tn
 
-    accuracy = (tp + tn) / total if total > 0 else 0.0
+    # Pass@1: per-sample accuracy across all n*N trials
+    pass_at_1 = (tp + tn) / total if total > 0 else 0.0
+    # Pass@8: per-prompt fraction with >=1 correct sample
+    pass_at_k = sum(1 for r in records if r["pass_at_k"]) / len(records) if records else 0.0
     fnr = fn / (tp + fn) if (tp + fn) > 0 else 0.0
     fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
 
@@ -124,7 +128,8 @@ def compute_summary(records):
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
         "total_samples": total,
         "n_prompts": len(records),
-        "accuracy": accuracy,
+        "pass_at_1": pass_at_1,
+        "pass_at_k": pass_at_k,
         "false_negative_rate": fnr,
         "false_positive_rate": fpr,
     }
@@ -165,68 +170,43 @@ def _eval_one_dataset(llm, tokenizer, sampling_params, dataset_path, mode,
         gt = "yes" if record["target"] == 1 else "no"
         src = record.get("_source_file", f"record_{i}")
 
-        n_completions = len(output.outputs)
-        if n_completions == 1:
-            raw_output = output.outputs[0].text
-            verdict = parse_verdict(raw_output)
-            pred = "yes" if verdict == "has_vul" else "no"
-            flag = compute_flag(gt, pred)
-            print(f"  [{i+1}/{len(records)}] {src}: gt={gt} pred={pred} flag={flag}")
-            results.append({
-                "input":         user_prompt,
-                "output":        raw_output,
-                "verdict":       verdict,
-                "pred":          pred,
-                "flag":          flag,
-                "is_vulnerable": gt,
-                "idx":           record.get("idx", i + 1),
-                "dataset":       record.get("dataset", "custom"),
-            })
-        else:
-            all_outputs = [o.text for o in output.outputs]
-            verdicts = [parse_verdict(t) for t in all_outputs]
-            votes = {
-                "has_vul": verdicts.count("has_vul"),
-                "no_vul":  verdicts.count("no_vul"),
-                "unknown": verdicts.count("unknown"),
-            }
-            print(f"  [{i+1}/{len(records)}] {src}: gt={gt} "
-                  f"has_vul={votes['has_vul']}/{n_completions} "
-                  f"no_vul={votes['no_vul']}/{n_completions}")
-            results.append({
-                "input":         user_prompt,
-                "all_outputs":   all_outputs,
-                "verdicts":      verdicts,
-                "votes":         votes,
-                "is_vulnerable": gt,
-                "idx":           record.get("idx", i + 1),
-                "dataset":       record.get("dataset", "custom"),
-            })
+        # Score each sample independently — no majority voting (official OpenVul metric).
+        # "unknown" (unparseable) counts as wrong, matching upstream calculate_metrics.
+        all_outputs = [o.text for o in output.outputs]
+        sample_verdicts = [parse_verdict(t) for t in all_outputs]
+        sample_preds = ["yes" if v == "has_vul" else "no" for v in sample_verdicts]
+        sample_flags = [compute_flag(gt, p) for p in sample_preds]
+        n_correct = sum(1 for f in sample_flags if f in ("tp", "tn"))
+        pass_at_k = n_correct > 0
+
+        print(f"  [{i+1}/{len(records)}] {src}: gt={gt} "
+              f"correct={n_correct}/{len(all_outputs)} "
+              f"pass@k={'Y' if pass_at_k else 'N'} flags={sample_flags}")
+        results.append({
+            "input":           user_prompt,
+            "all_outputs":     all_outputs,
+            "sample_verdicts": sample_verdicts,
+            "sample_preds":    sample_preds,
+            "sample_flags":    sample_flags,
+            "n_correct":       n_correct,
+            "pass_at_k":       pass_at_k,
+            "is_vulnerable":   gt,
+            "idx":             record.get("idx", i + 1),
+            "dataset":         record.get("dataset", "custom"),
+        })
 
     n_completions = sampling_params.n
-    if n_completions == 1:
-        summary = compute_summary(results)
-        print(
-            f"\nSummary over {summary['n_prompts']} prompts:\n"
-            f"  tp={summary['tp']} fp={summary['fp']} "
-            f"fn={summary['fn']} tn={summary['tn']}\n"
-            f"  Accuracy: {summary['accuracy']*100:.2f}%\n"
-            f"  FNR={summary['false_negative_rate']*100:.2f}%  "
-            f"FPR={summary['false_positive_rate']*100:.2f}%"
-        )
-    else:
-        total_has = sum(r["votes"]["has_vul"] for r in results)
-        total_no  = sum(r["votes"]["no_vul"]  for r in results)
-        summary = {
-            "n_prompts": len(results),
-            "n_completions_each": n_completions,
-            "total_has_vul_votes": total_has,
-            "total_no_vul_votes":  total_no,
-        }
-        print(f"\nVote summary over {len(results)} prompts × {n_completions} completions:")
-        for r in results:
-            src = r.get("idx", "?")
-            print(f"  idx={src}: has_vul={r['votes']['has_vul']}/{n_completions}")
+    summary = compute_summary(results)
+    print(
+        f"\nSummary over {summary['n_prompts']} prompts × {n_completions} samples "
+        f"= {summary['total_samples']} trials:\n"
+        f"  tp={summary['tp']} fp={summary['fp']} "
+        f"fn={summary['fn']} tn={summary['tn']}\n"
+        f"  Pass@1 (per-sample): {summary['pass_at_1']*100:.2f}%\n"
+        f"  Pass@{n_completions} (per-prompt): {summary['pass_at_k']*100:.2f}%\n"
+        f"  FNR={summary['false_negative_rate']*100:.2f}%  "
+        f"FPR={summary['false_positive_rate']*100:.2f}%"
+    )
 
     if save:
         os.makedirs(output_dir, exist_ok=True)
@@ -296,7 +276,7 @@ def main():
     parser.add_argument("--tp", type=int, default=1,
                         help="Tensor parallel size for vLLM")
     parser.add_argument("--n", type=int, default=1,
-                        help="Number of completions per prompt (>1 stores vote distribution, no majority voting)")
+                        help="Number of completions per prompt")
     parser.add_argument("--save", action="store_true",
                         help="Save result JSON to output-dir")
     args = parser.parse_args()
