@@ -73,9 +73,16 @@ _NPD_LINE = (
     "(CWE-476: NULL Pointer Dereference).\n"
 )
 
+_UAF_LINE = (
+    "Focus specifically on use-after-free vulnerabilities "
+    "(CWE-416: Use After Free).\n"
+)
+
+_MODE_LINES = {"npd": _NPD_LINE, "uaf": _UAF_LINE}
+
 
 def build_user_prompt(record, mode):
-    npd_line = _NPD_LINE if mode == "npd" else ""
+    npd_line = _MODE_LINES.get(mode, "")
     return _USER_TEMPLATE.format(
         context=record["context"],
         file_name=record["file_name"],
@@ -269,8 +276,8 @@ def main():
     parser.add_argument("--variants", nargs="+",
                         help="Variant names matching --dataset-paths")
 
-    parser.add_argument("--mode", choices=["generic", "npd"], default="generic",
-                        help="Prompt mode: generic (original) or npd (NPD-focused)")
+    parser.add_argument("--mode", choices=["generic", "npd", "uaf"], default="generic",
+                        help="Prompt mode: generic (original), npd (NPD-focused), or uaf (UAF-focused)")
     parser.add_argument("--model", default="Leopo1d/OpenVul-Qwen3-4B-GRPO",
                         help="HuggingFace model ID")
     parser.add_argument("--tp", type=int, default=1,
